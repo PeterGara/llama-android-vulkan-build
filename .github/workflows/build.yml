@@ -37,6 +37,31 @@ jobs:
           ls Vulkan-Headers/include/vulkan/vulkan.hpp
           ls SPIRV-Headers/include/spirv/unified1/spirv.hpp
 
+      # PATCH: llama.cpp inits the Vulkan-Hpp default dispatcher only with the
+      # *instance*. On Android (bare Mali driver, no full desktop loader) that
+      # leaves device-level entry points (e.g. vkAllocateMemory) as NULL ->
+      # SIGSEGV on the first allocation. Re-init the dispatcher with the device
+      # right after createDevice, as documented by Vulkan-Hpp.
+      - name: Patch Vulkan device dispatcher init
+        run: |
+          cd llama.cpp
+          python3 - <<'PYEOF'
+          p = 'ggml/src/ggml-vulkan/ggml-vulkan.cpp'
+          s = open(p).read()
+          needle = 'device->device = device->physical_device.createDevice(device_create_info);'
+          assert s.count(needle) == 1, 'needle count = %d' % s.count(needle)
+          ins = needle + '\n' + \
+              '\n' + \
+              '        // Android / Mali: instance-only dispatch leaves device-level\n' + \
+              '        // function pointers NULL. Re-init with the device (Vulkan-Hpp).\n' + \
+              '        VULKAN_HPP_DEFAULT_DISPATCHER.init(device->device);\n' + \
+              '        ggml_vk_default_dispatcher().init(device->device);'
+          s = s.replace(needle, ins, 1)
+          open(p, 'w').write(s)
+          print('patched ggml-vulkan.cpp')
+          PYEOF
+          grep -n -A3 'Android / Mali: instance-only' ggml/src/ggml-vulkan/ggml-vulkan.cpp
+
       - name: Download Android NDK ${{ env.NDK_VERSION }}
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
