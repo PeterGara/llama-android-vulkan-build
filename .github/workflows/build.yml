@@ -1,0 +1,82 @@
+name: build-android-vulkan
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      LLAMA_TAG: b11913
+      NDK_VERSION: r27c
+
+    steps:
+      - name: Install Vulkan + build tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential cmake ninja-build \
+            glslc libvulkan-dev spirv-headers python3 unzip wget
+
+      - name: Show glslc version
+        run: glslc --version || true
+
+      - name: Clone llama.cpp (tag ${{ env.LLAMA_TAG }})
+        run: |
+          git clone --depth 1 --branch ${LLAMA_TAG} https://github.com/ggml-org/llama.cpp.git
+          cd llama.cpp && git log -1 --oneline
+
+      - name: Download Android NDK ${{ env.NDK_VERSION }}
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
+          unzip -q android-ndk-${NDK_VERSION}-linux.zip
+          echo "ANDROID_NDK=$PWD/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
+
+      - name: Configure (Android arm64 + Vulkan)
+        run: |
+          cd llama.cpp
+          cmake -B build-android \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod \
+            -DGGML_VULKAN=ON \
+            -DGGML_OPENMP=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_SERVER=ON
+
+      - name: Build
+        run: cmake --build llama.cpp/build-android -j$(nproc)
+
+      - name: List built files
+        run: ls -la llama.cpp/build-android/bin
+
+      - name: Package
+        run: |
+          set -e
+          mkdir -p dist
+          cp -a llama.cpp/build-android/bin/. dist/
+          # Android's dlopen("libggml-vulkan.so") does not always resolve a
+          # versioned SONAME (libggml-vulkan.so.0) -> add unversioned copies.
+          cd dist
+          for f in lib*.so.*; do
+            [ -e "$f" ] || continue
+            base="${f%%.so.*}.so"
+            if [ ! -e "$base" ]; then cp -a "$f" "$base"; fi
+          done
+          cd "$GITHUB_WORKSPACE"
+          tar czf llama-android-arm64-vulkan.tar.gz -C dist .
+          ls -la llama-android-arm64-vulkan.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-android-arm64-vulkan
+          path: llama-android-arm64-vulkan.tar.gz
+          retention-days: 30
