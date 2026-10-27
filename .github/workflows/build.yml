@@ -25,35 +25,28 @@ jobs:
           git clone --depth 1 --branch ${LLAMA_TAG} https://github.com/ggml-org/llama.cpp.git
           cd llama.cpp && git log -1 --oneline
 
-      # NDK ships only vulkan/vulkan.h; the Vulkan backend needs the C++
-      # <vulkan/vulkan.hpp> and <spirv/unified1/spirv.hpp> (Khronos headers).
       - name: Fetch Khronos headers (Vulkan-Headers + SPIRV-Headers)
         run: |
           git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git
           git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git
-          ls Vulkan-Headers/include/vulkan/vulkan.hpp
-          ls SPIRV-Headers/include/spirv/unified1/spirv.hpp
 
-      # PATCH: per the Vulkan spec, vkGetInstanceProcAddr() returns NULL for
-      # device-level entry points (vkAllocateMemory, vkMapMemory, ...). Desktop
-      # loaders are lenient; the Android loader is spec-correct, so llama.cpp's
-      # instance-only dispatcher init leaves those pointers NULL -> SIGSEGV on
-      # the first VkDevice call. Re-init the dispatchers with vkGetDeviceProcAddr
-      # right after createDevice (4-arg Vulkan-Hpp form).
-      - name: Patch Vulkan device dispatcher init
+      - name: Patch ggml-vulkan (Mali driver workarounds)
         run: |
           cd llama.cpp
           python3 - <<'PYEOF'
           p = 'ggml/src/ggml-vulkan/ggml-vulkan.cpp'
           s = open(p).read()
+
+          # Patch A: device-level dispatcher init.
+          # Per spec, vkGetInstanceProcAddr returns NULL for device-level fns;
+          # Android loader is spec-correct so llama.cpp's instance-only init
+          # leaves them NULL. Re-init dispatchers with vkGetDeviceProcAddr.
           needle = 'device->device = device->physical_device.createDevice(device_create_info);'
-          assert s.count(needle) == 1, 'needle count = %d' % s.count(needle)
+          assert s.count(needle) == 1, 'A needle count = %d' % s.count(needle)
           block = (
             '\n'
             '\n'
-            '        // Android / spec-correct loader: vkGetInstanceProcAddr returns\n'
-            '        // NULL for device-level functions. Populate device entry points\n'
-            '        // via vkGetDeviceProcAddr as the Vulkan-Hpp docs require.\n'
+            '        // device-level dispatcher init (spec-correct loaders)\n'
             '        {\n'
             '            PFN_vkGetInstanceProcAddr _gipa = vkGetInstanceProcAddr;\n'
             '            PFN_vkGetDeviceProcAddr _gdpa = (PFN_vkGetDeviceProcAddr)\n'
@@ -65,10 +58,23 @@ jobs:
             '        }'
           )
           s = s.replace(needle, needle + block, 1)
+
+          # Patch B: Mali (MT6893) advertises VkPhysicalDeviceVulkan12Features.
+          # bufferDeviceAddress = true but does not return a vkGetBufferDeviceAddress
+          # entry point -> NULL call -> SIGSEGV. Disable BDA unless the fn exists.
+          needle2 = 'device->buffer_device_address = vk12_features.bufferDeviceAddress;'
+          assert s.count(needle2) == 1, 'B needle count = %d' % s.count(needle2)
+          repl2 = (
+            'device->buffer_device_address = vk12_features.bufferDeviceAddress\n'
+            '            && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetBufferDeviceAddress != nullptr\n'
+            '            && ggml_vk_default_dispatcher().vkGetBufferDeviceAddress != nullptr\n'
+            '            && getenv("GGML_VK_DISABLE_BUFFER_DEVICE_ADDRESS") == nullptr;'
+          )
+          s = s.replace(needle2, repl2, 1)
           open(p, 'w').write(s)
-          print('patched ggml-vulkan.cpp')
+          print('patched ggml-vulkan.cpp (A+B)')
           PYEOF
-          grep -n -A12 'Android / spec-correct loader' ggml/src/ggml-vulkan/ggml-vulkan.cpp
+          grep -n -B1 -A6 'buffer_device_address = vk12_features' ggml/src/ggml-vulkan/ggml-vulkan.cpp
 
       - name: Download Android NDK ${{ env.NDK_VERSION }}
         run: |
@@ -102,9 +108,6 @@ jobs:
 
       - name: Build
         run: cmake --build llama.cpp/build-android -j$(nproc)
-
-      - name: List built files
-        run: ls -la llama.cpp/build-android/bin
 
       - name: Package
         run: |
