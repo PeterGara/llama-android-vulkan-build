@@ -20,59 +20,56 @@ jobs:
           sudo apt-get install -y build-essential cmake ninja-build \
             glslc libvulkan-dev spirv-headers python3 unzip wget
 
-      - name: Clone llama.cpp (tag ${{ env.LLAMA_TAG }})
+      - name: Clone llama.cpp
         run: |
           git clone --depth 1 --branch ${LLAMA_TAG} https://github.com/ggml-org/llama.cpp.git
           cd llama.cpp && git log -1 --oneline
 
-      - name: Fetch Khronos headers (Vulkan-Headers + SPIRV-Headers)
+      - name: Fetch Khronos headers
         run: |
           git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git
           git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git
 
-      - name: Patch ggml-vulkan (Mali driver workarounds)
+      - name: Patch ggml-vulkan
         run: |
           cd llama.cpp
           python3 - <<'PYEOF'
           p = 'ggml/src/ggml-vulkan/ggml-vulkan.cpp'
           s = open(p).read()
 
-          # A: device-level dispatcher init (spec-correct loader)
           needle = 'device->device = device->physical_device.createDevice(device_create_info);'
           assert s.count(needle) == 1
           block = (
-            '\n'
-            '        {\n'
-            '            PFN_vkGetInstanceProcAddr _gipa = vkGetInstanceProcAddr;\n'
-            '            PFN_vkGetDeviceProcAddr _gdpa = (PFN_vkGetDeviceProcAddr)\n'
-            '                _gipa(vk_instance.instance, "vkGetDeviceProcAddr");\n'
-            '            if (_gdpa != nullptr) {\n'
-            '                VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance.instance, _gipa, device->device, _gdpa);\n'
-            '                ggml_vk_default_dispatcher().init(vk_instance.instance, _gipa, device->device, _gdpa);\n'
-            '            }\n'
-            '        }'
+              '\n'
+              '        {\n'
+              '            PFN_vkGetInstanceProcAddr _gipa = vkGetInstanceProcAddr;\n'
+              '            PFN_vkGetDeviceProcAddr _gdpa = (PFN_vkGetDeviceProcAddr)\n'
+              '                _gipa(vk_instance.instance, "vkGetDeviceProcAddr");\n'
+              '            if (_gdpa != nullptr) {\n'
+              '                VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance.instance, _gipa, device->device, _gdpa);\n'
+              '                ggml_vk_default_dispatcher().init(vk_instance.instance, _gipa, device->device, _gdpa);\n'
+              '            }\n'
+              '        }'
           )
           s = s.replace(needle, needle + block, 1)
 
-          # B: HARD-disable buffer device address (Mali returns NULL entry point)
           needle2 = 'device->buffer_device_address = vk12_features.bufferDeviceAddress;'
           assert s.count(needle2) == 1
-          s = s.replace(needle2,
-            'device->buffer_device_address = false; // Mali-G77 workaround: driver
-'
-            '            // advertises bufferDeviceAddress but returns a NULL entry point', 1)
-          open(p, 'w').write(s)
-          print('patched A+B (hard BDA off)')
-          PYEOF
-          grep -n -A2 'device->buffer_device_address' ggml/src/ggml-vulkan/ggml-vulkan.cpp | head
+          replacement2 = 'device->buffer_device_address = false;'
+          s = s.replace(needle2, replacement2, 1)
 
-      - name: Download Android NDK ${{ env.NDK_VERSION }}
+          open(p, 'w').write(s)
+          print('patched A+B')
+          PYEOF
+          grep -n 'device->buffer_device_address' ggml/src/ggml-vulkan/ggml-vulkan.cpp | head
+
+      - name: Download Android NDK
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
           unzip -q android-ndk-${NDK_VERSION}-linux.zip
           echo "ANDROID_NDK=$PWD/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
 
-      - name: Configure (Android arm64 + Vulkan)
+      - name: Configure
         run: |
           KHDR="-I$GITHUB_WORKSPACE/Vulkan-Headers/include -I$GITHUB_WORKSPACE/SPIRV-Headers/include"
           cd llama.cpp
