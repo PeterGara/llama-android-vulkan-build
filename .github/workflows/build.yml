@@ -20,9 +20,6 @@ jobs:
           sudo apt-get install -y build-essential cmake ninja-build \
             glslc libvulkan-dev spirv-headers python3 unzip wget
 
-      - name: Show glslc version
-        run: glslc --version || true
-
       - name: Clone llama.cpp (tag ${{ env.LLAMA_TAG }})
         run: |
           git clone --depth 1 --branch ${LLAMA_TAG} https://github.com/ggml-org/llama.cpp.git
@@ -37,11 +34,12 @@ jobs:
           ls Vulkan-Headers/include/vulkan/vulkan.hpp
           ls SPIRV-Headers/include/spirv/unified1/spirv.hpp
 
-      # PATCH: llama.cpp inits the Vulkan-Hpp default dispatcher only with the
-      # *instance*. On Android (bare Mali driver, no full desktop loader) that
-      # leaves device-level entry points (e.g. vkAllocateMemory) as NULL ->
-      # SIGSEGV on the first allocation. Re-init the dispatcher with the device
-      # right after createDevice, as documented by Vulkan-Hpp.
+      # PATCH: per the Vulkan spec, vkGetInstanceProcAddr() returns NULL for
+      # device-level entry points (vkAllocateMemory, vkMapMemory, ...). Desktop
+      # loaders are lenient; the Android loader is spec-correct, so llama.cpp's
+      # instance-only dispatcher init leaves those pointers NULL -> SIGSEGV on
+      # the first VkDevice call. Re-init the dispatchers with vkGetDeviceProcAddr
+      # right after createDevice (4-arg Vulkan-Hpp form).
       - name: Patch Vulkan device dispatcher init
         run: |
           cd llama.cpp
@@ -50,17 +48,27 @@ jobs:
           s = open(p).read()
           needle = 'device->device = device->physical_device.createDevice(device_create_info);'
           assert s.count(needle) == 1, 'needle count = %d' % s.count(needle)
-          ins = needle + '\n' + \
-              '\n' + \
-              '        // Android / Mali: instance-only dispatch leaves device-level\n' + \
-              '        // function pointers NULL. Re-init with the device (Vulkan-Hpp).\n' + \
-              '        VULKAN_HPP_DEFAULT_DISPATCHER.init(device->device);\n' + \
-              '        ggml_vk_default_dispatcher().init(device->device);'
-          s = s.replace(needle, ins, 1)
+          block = (
+            '\n'
+            '\n'
+            '        // Android / spec-correct loader: vkGetInstanceProcAddr returns\n'
+            '        // NULL for device-level functions. Populate device entry points\n'
+            '        // via vkGetDeviceProcAddr as the Vulkan-Hpp docs require.\n'
+            '        {\n'
+            '            PFN_vkGetInstanceProcAddr _gipa = vkGetInstanceProcAddr;\n'
+            '            PFN_vkGetDeviceProcAddr _gdpa = (PFN_vkGetDeviceProcAddr)\n'
+            '                _gipa(vk_instance.instance, "vkGetDeviceProcAddr");\n'
+            '            if (_gdpa != nullptr) {\n'
+            '                VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance.instance, _gipa, device->device, _gdpa);\n'
+            '                ggml_vk_default_dispatcher().init(vk_instance.instance, _gipa, device->device, _gdpa);\n'
+            '            }\n'
+            '        }'
+          )
+          s = s.replace(needle, needle + block, 1)
           open(p, 'w').write(s)
           print('patched ggml-vulkan.cpp')
           PYEOF
-          grep -n -A3 'Android / Mali: instance-only' ggml/src/ggml-vulkan/ggml-vulkan.cpp
+          grep -n -A12 'Android / spec-correct loader' ggml/src/ggml-vulkan/ggml-vulkan.cpp
 
       - name: Download Android NDK ${{ env.NDK_VERSION }}
         run: |
@@ -103,8 +111,6 @@ jobs:
           set -e
           mkdir -p dist
           cp -a llama.cpp/build-android/bin/. dist/
-          # Android's dlopen("libggml-vulkan.so") does not always resolve a
-          # versioned SONAME (libggml-vulkan.so.0) -> add unversioned copies.
           cd dist
           for f in lib*.so.*; do
             [ -e "$f" ] || continue
