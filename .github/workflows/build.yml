@@ -14,7 +14,7 @@ jobs:
       - name: Checkout (wrapper toolchain)
         uses: actions/checkout@v4
 
-      - name: Install Vulkan + build tools
+      - name: Install build tools
         run: |
           sudo apt-get update -y
           sudo apt-get install -y build-essential cmake ninja-build \
@@ -27,6 +27,14 @@ jobs:
         run: |
           git clone --depth 1 --branch ${LLAMA_TAG} https://github.com/ggml-org/llama.cpp.git
           cd llama.cpp && git log -1 --oneline
+
+      # The Android NDK ships only the C header (vulkan/vulkan.h). The Vulkan
+      # backend includes the C++ header <vulkan/vulkan.hpp>, which lives in the
+      # Khronos Vulkan-Headers repo (Termux uses the same vulkan-headers dep).
+      - name: Fetch Vulkan-Headers (C++ vulkan.hpp)
+        run: |
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git
+          ls Vulkan-Headers/include/vulkan | head
 
       - name: Download Android NDK ${{ env.NDK_VERSION }}
         run: |
@@ -48,6 +56,7 @@ jobs:
             -DGGML_NATIVE=OFF \
             -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod \
             -DGGML_VULKAN=ON \
+            -DVulkan_INCLUDE_DIR=$GITHUB_WORKSPACE/Vulkan-Headers/include \
             -DGGML_OPENMP=OFF \
             -DGGML_BACKEND_DL=ON \
             -DLLAMA_CURL=OFF \
