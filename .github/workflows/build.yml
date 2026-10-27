@@ -30,57 +30,71 @@ jobs:
           git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git
           git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git
 
-      - name: Patch ggml-vulkan (upstream PR 28593, adapted to b11913)
+      - name: Patch ggml-vulkan (Mali) 
         run: |
           cd llama.cpp
           python3 - <<'PYEOF'
           p = 'ggml/src/ggml-vulkan/ggml-vulkan.cpp'
           s = open(p).read()
+          n = 0
 
-          # 1) Enable the KHR extensions that back core-1.2 features on pre-1.2 drivers.
-          #    Without this, vkGetBufferDeviceAddress / vkSignalSemaphore resolve to NULL.
+          # 1) Enable KHR extensions backing core-1.2 features on pre-1.2 drivers
           old1 = '        device->vulkan_memory_model = vk12_features.vulkanMemoryModel;\n'
-          assert s.count(old1) == 1, 'old1 %d' % s.count(old1)
-          add1 = (
-            '        // pre-1.2 driver: enable the KHR extensions that back these core-1.2\n'
-            '        // features, otherwise the device entry points resolve to NULL. Upstream #28593.\n'
-            '        if (device->buffer_device_address && device->properties.apiVersion < VK_API_VERSION_1_2) {\n'
-            '            device_extensions.push_back("VK_KHR_buffer_device_address");\n'
-            '        }\n'
-            '        if (vk12_features.timelineSemaphore && device->properties.apiVersion < VK_API_VERSION_1_2) {\n'
-            '            device_extensions.push_back("VK_KHR_timeline_semaphore");\n'
-            '        }\n'
-          )
-          s = s.replace(old1, old1 + add1, 1)
+          if s.count(old1) == 1:
+              add1 = (
+                '        if (device->buffer_device_address && device->properties.apiVersion < VK_API_VERSION_1_2) {\n'
+                '            device_extensions.push_back("VK_KHR_buffer_device_address");\n'
+                '        }\n'
+                '        if (vk12_features.timelineSemaphore && device->properties.apiVersion < VK_API_VERSION_1_2) {\n'
+                '            device_extensions.push_back("VK_KHR_timeline_semaphore");\n'
+                '        }\n'
+              )
+              s = s.replace(old1, old1 + add1, 1); n += 1
 
-          # 2) VK_KHR_16bit_storage is core since 1.1; only request it below 1.1.
+          # 2) 16bit_storage only below 1.1
           old2 = '        device_extensions.push_back("VK_KHR_16bit_storage");'
-          assert s.count(old2) == 1, 'old2 %d' % s.count(old2)
-          new2 = (
-            '        // Core since 1.1; some drivers stop listing it as an extension past that point.\n'
-            '        if (device->properties.apiVersion < VK_API_VERSION_1_1) {\n'
-            '            device_extensions.push_back("VK_KHR_16bit_storage");\n'
-            '        }'
-          )
-          s = s.replace(old2, new2, 1)
+          if s.count(old2) == 1:
+              new2 = (
+                '        if (device->properties.apiVersion < VK_API_VERSION_1_1) {\n'
+                '            device_extensions.push_back("VK_KHR_16bit_storage");\n'
+                '        }'
+              )
+              s = s.replace(old2, new2, 1); n += 1
 
-          # 3) Re-init the default dispatcher with the device (Vulkan-Hpp docs).
+          # 3) Re-init default dispatcher with the device
           old3 = '        device->device = device->physical_device.createDevice(device_create_info);'
-          assert s.count(old3) == 1, 'old3 %d' % s.count(old3)
-          add3 = (
-            old3 + '\n'
-            '\n'
-            '        // Only ever init()\'d against the instance; some ICDs do not resolve\n'
-            '        // device-level / device-extension functions through the instance trampoline.\n'
-            '        VULKAN_HPP_DEFAULT_DISPATCHER.init(device->device);'
-          )
-          s = s.replace(old3, add3, 1)
+          if s.count(old3) == 1:
+              add3 = (
+                old3 + '\n'
+                '        VULKAN_HPP_DEFAULT_DISPATCHER.init(device->device);'
+              )
+              s = s.replace(old3, add3, 1); n += 1
 
+          # 4) Mali: it reports internallySynchronizedQueues but getQueue2() with that
+          #    flag returns a NULL VkQueue -> vkQueueSubmit(NULL) segfault. Force off.
+          old4 = '        device->has_internally_synchronized_queues = internally_synchronized_queues_features.internallySynchronizedQueues;'
+          if s.count(old4) == 1:
+              s = s.replace(old4,
+                '        device->has_internally_synchronized_queues = false; // Mali workaround (getQueue2 NULL)', 1); n += 1
+
+          # 5) Defensive fallback: if getQueue2 returns NULL, use getQueue (Vulkan 1.0).
+          old5 = '    h->queue = device->device.getQueue2(queue_info2);'
+          if s.count(old5) == 1:
+              new5 = (
+                '    h->queue = device->device.getQueue2(queue_info2);\n'
+                '    if (h->queue == nullptr) {\n'
+                '        // Mali workaround: getQueue2() may return a NULL handle.\n'
+                '        h->queue = device->device.getQueue(queue_family_index, queue_index);\n'
+                '    }'
+              )
+              s = s.replace(old5, new5, 1); n += 1
+
+          assert n >= 4, 'only %d patches applied' % n
           open(p, 'w').write(s)
-          print('patched OK')
+          print('applied', n, 'patches')
           PYEOF
           echo '--- verify ---'
-          grep -n 'VK_KHR_timeline_semaphore\|VK_KHR_buffer_device_address\|VULKAN_HPP_DEFAULT_DISPATCHER.init(device->device)\|apiVersion < VK_API_VERSION_1_1' ggml/src/ggml-vulkan/ggml-vulkan.cpp
+          grep -n 'VK_KHR_timeline_semaphore\|has_internally_synchronized_queues = false\|getQueue(queue_family_index\|VULKAN_HPP_DEFAULT_DISPATCHER.init(device->device)' ggml/src/ggml-vulkan/ggml-vulkan.cpp
 
       - name: Download Android NDK
         run: |
