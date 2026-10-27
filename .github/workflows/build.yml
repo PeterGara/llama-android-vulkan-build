@@ -11,6 +11,9 @@ jobs:
       NDK_VERSION: r27c
 
     steps:
+      - name: Checkout (wrapper toolchain)
+        uses: actions/checkout@v4
+
       - name: Install Vulkan + build tools
         run: |
           sudo apt-get update -y
