@@ -37,16 +37,11 @@ jobs:
           p = 'ggml/src/ggml-vulkan/ggml-vulkan.cpp'
           s = open(p).read()
 
-          # Patch A: device-level dispatcher init.
-          # Per spec, vkGetInstanceProcAddr returns NULL for device-level fns;
-          # Android loader is spec-correct so llama.cpp's instance-only init
-          # leaves them NULL. Re-init dispatchers with vkGetDeviceProcAddr.
+          # A: device-level dispatcher init (spec-correct loader)
           needle = 'device->device = device->physical_device.createDevice(device_create_info);'
-          assert s.count(needle) == 1, 'A needle count = %d' % s.count(needle)
+          assert s.count(needle) == 1
           block = (
             '\n'
-            '\n'
-            '        // device-level dispatcher init (spec-correct loaders)\n'
             '        {\n'
             '            PFN_vkGetInstanceProcAddr _gipa = vkGetInstanceProcAddr;\n'
             '            PFN_vkGetDeviceProcAddr _gdpa = (PFN_vkGetDeviceProcAddr)\n'
@@ -59,22 +54,17 @@ jobs:
           )
           s = s.replace(needle, needle + block, 1)
 
-          # Patch B: Mali (MT6893) advertises VkPhysicalDeviceVulkan12Features.
-          # bufferDeviceAddress = true but does not return a vkGetBufferDeviceAddress
-          # entry point -> NULL call -> SIGSEGV. Disable BDA unless the fn exists.
+          # B: HARD-disable buffer device address (Mali returns NULL entry point)
           needle2 = 'device->buffer_device_address = vk12_features.bufferDeviceAddress;'
-          assert s.count(needle2) == 1, 'B needle count = %d' % s.count(needle2)
-          repl2 = (
-            'device->buffer_device_address = vk12_features.bufferDeviceAddress\n'
-            '            && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetBufferDeviceAddress != nullptr\n'
-            '            && ggml_vk_default_dispatcher().vkGetBufferDeviceAddress != nullptr\n'
-            '            && getenv("GGML_VK_DISABLE_BUFFER_DEVICE_ADDRESS") == nullptr;'
-          )
-          s = s.replace(needle2, repl2, 1)
+          assert s.count(needle2) == 1
+          s = s.replace(needle2,
+            'device->buffer_device_address = false; // Mali-G77 workaround: driver
+'
+            '            // advertises bufferDeviceAddress but returns a NULL entry point', 1)
           open(p, 'w').write(s)
-          print('patched ggml-vulkan.cpp (A+B)')
+          print('patched A+B (hard BDA off)')
           PYEOF
-          grep -n -B1 -A6 'buffer_device_address = vk12_features' ggml/src/ggml-vulkan/ggml-vulkan.cpp
+          grep -n -A2 'device->buffer_device_address' ggml/src/ggml-vulkan/ggml-vulkan.cpp | head
 
       - name: Download Android NDK ${{ env.NDK_VERSION }}
         run: |
@@ -86,25 +76,16 @@ jobs:
         run: |
           KHDR="-I$GITHUB_WORKSPACE/Vulkan-Headers/include -I$GITHUB_WORKSPACE/SPIRV-Headers/include"
           cd llama.cpp
-          cmake -B build-android \
-            -G Ninja \
+          cmake -B build-android -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/cmake/android-vulkan-toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS="$KHDR" \
-            -DCMAKE_CXX_FLAGS="$KHDR" \
-            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DGGML_NATIVE=OFF \
-            -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod \
-            -DGGML_VULKAN=ON \
-            -DVulkan_INCLUDE_DIR=$GITHUB_WORKSPACE/Vulkan-Headers/include \
-            -DGGML_OPENMP=OFF \
-            -DGGML_BACKEND_DL=ON \
-            -DLLAMA_CURL=OFF \
-            -DLLAMA_OPENSSL=OFF \
-            -DLLAMA_BUILD_SERVER=ON
+            -DCMAKE_C_FLAGS="$KHDR" -DCMAKE_CXX_FLAGS="$KHDR" \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod \
+            -DGGML_VULKAN=ON -DVulkan_INCLUDE_DIR=$GITHUB_WORKSPACE/Vulkan-Headers/include \
+            -DGGML_OPENMP=OFF -DGGML_BACKEND_DL=ON \
+            -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_SERVER=ON
 
       - name: Build
         run: cmake --build llama.cpp/build-android -j$(nproc)
@@ -112,17 +93,11 @@ jobs:
       - name: Package
         run: |
           set -e
-          mkdir -p dist
-          cp -a llama.cpp/build-android/bin/. dist/
+          mkdir -p dist && cp -a llama.cpp/build-android/bin/. dist/
           cd dist
-          for f in lib*.so.*; do
-            [ -e "$f" ] || continue
-            base="${f%%.so.*}.so"
-            if [ ! -e "$base" ]; then cp -a "$f" "$base"; fi
-          done
+          for f in lib*.so.*; do [ -e "$f" ] || continue; base="${f%%.so.*}.so"; [ -e "$base" ] || cp -a "$f" "$base"; done
           cd "$GITHUB_WORKSPACE"
           tar czf llama-android-arm64-vulkan.tar.gz -C dist .
-          ls -la llama-android-arm64-vulkan.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
