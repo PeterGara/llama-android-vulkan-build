@@ -30,38 +30,17 @@ jobs:
           git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git
           git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git
 
-      - name: Patch ggml-vulkan
+      # Apply upstream PR #28593: "vulkan: fix three null-pointer crashes on
+      # pre-1.2 devices reporting VK 1.2 features". This is the exact class of
+      # bug we hit on Mali-G77 (Android): driver reports VK 1.2 feature bits but
+      # does not expose the corresponding entry points.
+      - name: Apply upstream PR 28593
         run: |
           cd llama.cpp
-          python3 - <<'PYEOF'
-          p = 'ggml/src/ggml-vulkan/ggml-vulkan.cpp'
-          s = open(p).read()
-
-          needle = 'device->device = device->physical_device.createDevice(device_create_info);'
-          assert s.count(needle) == 1
-          block = (
-              '\n'
-              '        {\n'
-              '            PFN_vkGetInstanceProcAddr _gipa = vkGetInstanceProcAddr;\n'
-              '            PFN_vkGetDeviceProcAddr _gdpa = (PFN_vkGetDeviceProcAddr)\n'
-              '                _gipa(vk_instance.instance, "vkGetDeviceProcAddr");\n'
-              '            if (_gdpa != nullptr) {\n'
-              '                VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance.instance, _gipa, device->device, _gdpa);\n'
-              '                ggml_vk_default_dispatcher().init(vk_instance.instance, _gipa, device->device, _gdpa);\n'
-              '            }\n'
-              '        }'
-          )
-          s = s.replace(needle, needle + block, 1)
-
-          needle2 = 'device->buffer_device_address = vk12_features.bufferDeviceAddress;'
-          assert s.count(needle2) == 1
-          replacement2 = 'device->buffer_device_address = false;'
-          s = s.replace(needle2, replacement2, 1)
-
-          open(p, 'w').write(s)
-          print('patched A+B')
-          PYEOF
-          grep -n 'device->buffer_device_address' ggml/src/ggml-vulkan/ggml-vulkan.cpp | head
+          wget -q -O /tmp/pr28593.diff https://github.com/ggml-org/llama.cpp/pull/28593.diff
+          git apply --verbose /tmp/pr28593.diff
+          echo '--- applied; context ---'
+          grep -n 'VK_KHR_timeline_semaphore\|VK_KHR_buffer_device_address\|VULKAN_HPP_DEFAULT_DISPATCHER.init(device->device)\|VK_KHR_16bit_storage' ggml/src/ggml-vulkan/ggml-vulkan.cpp
 
       - name: Download Android NDK
         run: |
